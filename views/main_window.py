@@ -946,6 +946,14 @@ class MainWindow(QMainWindow):
         invert_action.triggered.connect(self._on_invert_selection)
         edit_menu.addAction(invert_action)
 
+        # Edit ▸ Select none, the usual shortcut.
+        select_none_action = QAction(tr("Select None"), self)
+        select_none_action.setStatusTip(tr(
+            "Deselect everything: edges, faces, groups and dimensions."))
+        select_none_action.setShortcut(QKeySequence("Ctrl+T"))
+        select_none_action.triggered.connect(self._on_select_none)
+        edit_menu.addAction(select_none_action)
+
         edit_menu.addSeparator()
 
         group_action = QAction(tr("Make Group"), self)
@@ -3940,6 +3948,16 @@ class MainWindow(QMainWindow):
         self.viewport.notify_scene_changed()
         self.statusBar().showMessage(
             tr("Selection inverted ({n} entities)", n=n), 2500)
+
+    def _on_select_none(self) -> None:
+        """Deselect everything (Ctrl+T), the counterpart of Select All
+        (Ctrl+A). Emptying the selection is a change of what is shown, not
+        of the document, so the drawing is not marked unsaved (issue #38)."""
+        n = len(self.viewport.scene.selection)
+        self.viewport.scene.clear_selection()
+        self.viewport.notify_scene_changed()
+        self.statusBar().showMessage(
+            tr("Selection cleared ({n} entities)", n=n), 2500)
 
     # ---- Undo / redo --------------------------------------------------------
     def _on_undo(self) -> None:
