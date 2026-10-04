@@ -174,6 +174,24 @@ def test_a_raising_provider_cannot_take_the_cursor(levels):
     assert vp._extension_snap(s, 10, 10) is s
 
 
+def test_a_provider_is_handed_the_viewport_not_the_engine(levels):
+    """The provider signature stayed ``fn(viewport, snap, px, py)`` across
+    the extraction (the rule now lives in ``InferenceEngine``): a plugin
+    never learns that there is an engine."""
+    from core.snap import SnapResult
+    vp = levels.viewport
+    seen = []
+
+    def spy(viewport, snap, x, y):
+        seen.append((viewport, snap, x, y))
+        return None
+
+    vp._ext_snap_providers.insert(0, spy)
+    s = SnapResult(V(0, 0, 0), "on_face")
+    assert vp._extension_snap(s, 10, 10) is s
+    assert seen and seen[0][0] is vp and seen[0][2:] == (10, 10)
+
+
 def test_levels_panel_has_a_one_click_way_to_where_the_guides_show(levels):
     """«Hice niveles pero no veo nada en el dibujo» — the camera was in
     perspective. The panel's button goes to a parallel front elevation."""

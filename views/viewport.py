@@ -113,11 +113,12 @@ from core.history import EraseSelectionCommand, History
 from core.scene import Scene
 from core.style import DEFAULT_BACK_COLOR, effective_back_color
 from core.materials import material_sig as _material_sig
-from core.snap import SnapResult, _AXIS_VECTORS, compute_snap
+from core.snap import SnapResult, _AXIS_VECTORS
 from core.texture import face_uv_axes
 from core.triangulate import plane_axes
 from tools.base import Tool, ToolContext
 from tools.select import selection_mode
+from core.inference import InferenceEngine
 
 
 class _HoverEvent:
@@ -890,9 +891,13 @@ class Viewport(QOpenGLWidget):
         from core import units as _units
         _units.bind_scene(self.scene)   # readouts format in the model's units
         self.history = History(self.scene)
+        # Snapping inference state (hover / acquired edges and points,
+        # the encouraged points, the axis and reference locks, the last
+        # snap) gathered in its own collaborator. The delegating
+        # properties further down keep the old attribute names reading
+        # and writing through to it.
+        self.inference = InferenceEngine(self)
         self.active_tool: Optional[Tool] = None
-        self.axis_lock: Optional[str] = None  # None | "x" | "y" | "z"
-        self.last_snap: Optional[SnapResult] = None
         # Extensions' overlays and snap providers (views.extension_api).
         self._ext_overlays: list = []
         self._ext_snap_providers: list = []
@@ -901,9 +906,6 @@ class Viewport(QOpenGLWidget):
         # place it under the cursor.
         self.clipboard: Optional[dict] = None
 
-        # Reference-edge state (Down arrow → parallel / perpendicular).
-        self.reference_edge = None
-        self.reference_mode: Optional[str] = None  # None | "parallel" | "perpendicular"
         # Linear-inference toggle (Alt): "all" | "off" | "parallel_perp".
         self.linear_inference_mode = "all"
         #: A bare Alt is down and nothing else has happened since — the tap
@@ -911,34 +913,6 @@ class Viewport(QOpenGLWidget):
         self._alt_tap = False
         self._alt_down = False
         _AltWatch.watch(self)
-        # Sticky inference lock (Shift): (direction, color) captured from the
-        # active inference, held until Shift is released.
-        self._shift_lock: Optional[tuple] = None
-        self._hover_edge = None  # last edge under cursor (candidate for capture)
-        # Center inference: the centre of the last circle or arc
-        # the cursor visited (its edge, or a face it bounds), kept as a
-        # reference until another circle takes its place or the tool
-        # changes — «me marca un punto verde en el centro del círculo…
-        # esto me sirve para dibujar, acotar, mover» (Marco, 2026-09-11).
-        # ``(centre, radius, key)``.
-        self._center_ref = None
-        # Edge/corner/face hovered while drawing, held as soft references
-        # ("from point" / "through point" / "perpendicular to face"
-        # acquisition). Cleared when no segment is in progress.
-        self._acquired_edge = None
-        self._acquired_point = None
-        self._acquired_face_normal = None
-        # Encouraged points: the last two points the cursor
-        # PAUSED on (a corner, a circle's centre). The 'from point' dotted
-        # line runs from them — from both at once where their axis lines
-        # cross. Pausing, not merely crossing: sweeping over a vertex on the
-        # way somewhere else must not steal the reference.
-        self._encouraged: list = []
-        self._dwell_point: Optional[QVector3D] = None
-        self._dwell_timer = QTimer(self)
-        self._dwell_timer.setSingleShot(True)
-        self._dwell_timer.setInterval(self.ENCOURAGE_MS)
-        self._dwell_timer.timeout.connect(self._encourage_dwelt)
         self._last_mouse_pos: Optional[QPointF] = None
 
         # Pixel radius for point snaps (endpoint, origin, close). 12 px felt
@@ -10343,28 +10317,6 @@ class Viewport(QOpenGLWidget):
                 pts.append(_SnapEdge(p, QVector3D(p)))
         return pts
 
-    def _axis_source_cue(self, snap, px_x: float, px_y: float):
-        """Before its first click, a tool that reads the model axes as a
-        source (the Tape: ``axis_source``) shows the cursor is ON the red,
-        green or blue axis — the classic small square on the axis line.
-        Without the cue the axis looked ungrabbable (Marco, testing
-        Rafael's guide from an axis, 2026-09-21): the pick worked, nothing
-        said so. Only where the engine found nothing better."""
-        tool = self.active_tool
-        if (snap is None or not getattr(tool, "axis_source", False)
-                or getattr(tool, "start_point", None) is not None
-                or snap.kind not in ("none", "on_face")):
-            return snap
-        name = self.pick_axis(px_x, px_y)
-        if name is None:
-            return snap
-        from core.snap import AXIS_COLORS
-        from core import axes as _axes
-        axis = _axes.axis(name)
-        o = _axes.origin()
-        foot = o + axis * QVector3D.dotProduct(snap.point - o, axis)
-        return SnapResult(foot, "on_axis", AXIS_COLORS[name], axis=name)
-
     def pick_axis(self, screen_x: float, screen_y: float):
         """The model axis line under the cursor — ``"x"`` / ``"y"`` /
         ``"z"`` — or ``None``. The Tape reads an axis as a guide source
@@ -11748,32 +11700,144 @@ class Viewport(QOpenGLWidget):
             # under the frame telemetry's floor.
             _plog("hover.move", self._hover_cost * 1000.0, floor=80.0)
 
+    # -- Snapping inference, delegated to self.inference -----------------
+    # The reference state (the hover / acquired edges and points, the centre
+    # reference, the axis and reference locks, the last snap) lives in
+    # core.inference.InferenceEngine, and so do the rules that used to be the
+    # two post-processors of the search (the axis-source cue, the extension
+    # hooks). These properties and thin wrappers keep the surface the tools,
+    # the extensions, the probe and the tests read and write, so the
+    # extraction stays behaviour-neutral.
+    @property
+    def _acquired_point(self) -> Optional[QVector3D]:
+        return self.inference._acquired_point
+
+    @_acquired_point.setter
+    def _acquired_point(self, value: Optional[QVector3D]) -> None:
+        self.inference._acquired_point = value
+
+    @property
+    def _encouraged(self) -> list:
+        return self.inference._encouraged
+
+    @_encouraged.setter
+    def _encouraged(self, value: list) -> None:
+        self.inference._encouraged = value
+
+    @property
+    def _dwell_point(self) -> Optional[QVector3D]:
+        return self.inference._dwell_point
+
+    @_dwell_point.setter
+    def _dwell_point(self, value: Optional[QVector3D]) -> None:
+        self.inference._dwell_point = value
+
+    @property
+    def _dwell_timer(self) -> QTimer:
+        return self.inference._dwell_timer
+
+    @_dwell_timer.setter
+    def _dwell_timer(self, value: QTimer) -> None:
+        self.inference._dwell_timer = value
+
+    @property
+    def axis_lock(self) -> Optional[str]:
+        return self.inference.axis_lock
+
+    @axis_lock.setter
+    def axis_lock(self, value: Optional[str]) -> None:
+        self.inference.axis_lock = value
+
+    @property
+    def last_snap(self) -> Optional[SnapResult]:
+        return self.inference.last_snap
+
+    @last_snap.setter
+    def last_snap(self, value) -> None:
+        self.inference.last_snap = value
+
+    @property
+    def reference_edge(self):
+        return self.inference.reference_edge
+
+    @reference_edge.setter
+    def reference_edge(self, value) -> None:
+        self.inference.reference_edge = value
+
+    @property
+    def reference_mode(self) -> Optional[str]:
+        return self.inference.reference_mode
+
+    @reference_mode.setter
+    def reference_mode(self, value: Optional[str]) -> None:
+        self.inference.reference_mode = value
+
+    @property
+    def _shift_lock(self):
+        return self.inference._shift_lock
+
+    @_shift_lock.setter
+    def _shift_lock(self, value) -> None:
+        self.inference._shift_lock = value
+
+    @property
+    def _hover_edge(self):
+        return self.inference._hover_edge
+
+    @_hover_edge.setter
+    def _hover_edge(self, value) -> None:
+        self.inference._hover_edge = value
+
+    @property
+    def _hover_center(self):
+        return self.inference._hover_center
+
+    @_hover_center.setter
+    def _hover_center(self, value) -> None:
+        self.inference._hover_center = value
+
+    @property
+    def _center_ref(self):
+        return self.inference._center_ref
+
+    @_center_ref.setter
+    def _center_ref(self, value) -> None:
+        self.inference._center_ref = value
+
+    @property
+    def _acquired_edge(self):
+        return self.inference._acquired_edge
+
+    @_acquired_edge.setter
+    def _acquired_edge(self, value) -> None:
+        self.inference._acquired_edge = value
+
+    @property
+    def _acquired_face_normal(self):
+        return self.inference._acquired_face_normal
+
+    @_acquired_face_normal.setter
+    def _acquired_face_normal(self, value) -> None:
+        self.inference._acquired_face_normal = value
+
     def _dwell_on(self, point: Optional[QVector3D]) -> None:
-        """The cursor is over ``point`` (or nothing): (re)start the pause
-        that turns it into an encouraged point."""
-        if point is None:
-            self._dwell_point = None
-            self._dwell_timer.stop()
-            return
-        if (self._dwell_point is not None
-                and (self._dwell_point - point).length() < 1e-6):
-            return                                  # still resting on it
-        self._dwell_point = QVector3D(point)
-        self._dwell_timer.start()
+        self.inference._dwell_on(point)
 
     def _encourage_dwelt(self) -> None:
-        if self._dwell_point is not None:
-            self.encourage_point(self._dwell_point)
+        self.inference._encourage_dwelt()
 
     def encourage_point(self, point: QVector3D) -> None:
-        """Make ``point`` the newest encouraged point (two are kept, the
-        older one drops), and the 'from point' reference."""
-        pt = QVector3D(point)
-        self._encouraged = [p for p in self._encouraged if (p - pt).length() > 1e-6]
-        self._encouraged.append(pt)
-        del self._encouraged[:-2]
-        self._acquired_point = pt
-        self.update()
+        self.inference.encourage_point(point)
+
+    # The two post-processors of the search (the axis-source cue for the
+    # tools that read the model axes as a source, the extension hooks) moved
+    # behind ``self.inference.snap()`` too. The names stay on the viewport
+    # because the extension tests and the probe call them from here.
+    def _axis_source_cue(self, snap, px_x: float, px_y: float):
+        return self.inference._axis_source_cue(snap, px_x, px_y)
+
+    def _extension_snap(self, snap, px_x: float, px_y: float):
+        return self.inference._extension_snap(snap, px_x, px_y)
 
     def _process_hover(self, pos, modifiers) -> None:
         if self._last_pos is not None or self._box_active:
@@ -11798,49 +11862,7 @@ class Viewport(QOpenGLWidget):
         win = self.window()
         if hasattr(win, "on_viewport_hover"):
             win.on_viewport_hover(ev.position().x(), ev.position().y())
-        tool = self.active_tool
-        if tool is not None and (tool.uses_snap
-                                 or getattr(tool, "hover_group_edges", False)):
-            self._hover_edge = self.pick_edge_any(ev.position().x(), ev.position().y())
-        else:
-            self._hover_edge = self.pick_edge(ev.position().x(), ev.position().y())
-        _hmark("pickedge")
-        if self.active_tool is not None and self.active_tool.uses_snap:
-            # Only the tools that snap can use a centre; Select and
-            # Push/Pull never pay for the fit. Hovering the rim ENCOURAGES
-            # the centre like a corner: the dotted axis line then runs from
-            # it (Marco's capture, 2026-09-14 — a circle placed
-            # in line with another's centre).
-            self._hover_center = self._update_center_ref(
-                ev.position().x(), ev.position().y())
-
-        # While a segment is being drawn, hovering an edge acquires it as a soft
-        # parallel reference; the acquisition is dropped once nothing is in
-        # progress, so it never goes stale across separate draws. A hovered
-        # CORNER is kept even before the first click (an encouraged
-        # point): the first corner of a window lines up with the door's on a
-        # dotted line from it (Rafael's review, 2026-09-10).
-        drawing = (
-            self.active_tool is not None
-            and getattr(self.active_tool, "start_point", None) is not None
-        )
-        if drawing and self.active_tool.uses_snap:
-            # Mid-segment: the corner under the cursor is a soft, instant
-            # reference (through point / from point), as always.
-            corner = self.pick_vertex(ev.position().x(), ev.position().y())
-            if corner is not None:
-                self._acquired_point = corner
-        if not drawing:
-            self._acquired_edge = None
-            self._acquired_face_normal = None
-        else:
-            if self._hover_edge is not None:
-                self._acquired_edge = self._hover_edge
-            face, _g = self.pick_face_placement(ev.position().x(), ev.position().y())
-            if face is not None:
-                from core.snap import face_plane_world
-                self._acquired_face_normal = face_plane_world(
-                    face, getattr(_g, "xform", None))[1]
+        self.inference.acquire(ev.position().x(), ev.position().y())
 
         if self.active_tool is None:
             return
@@ -12450,45 +12472,11 @@ class Viewport(QOpenGLWidget):
             return
         from PySide6.QtGui import QGuiApplication
 
-        p = self._last_mouse_pos.toPoint()
-        px_x, px_y = p.x(), p.y()
-        world_raw = self._world_from_pixel(px_x, px_y)
-        if world_raw is None:
-            return
         modifiers = QGuiApplication.keyboardModifiers()
-        chain_first = getattr(self.active_tool, "chain_first_point", None)
-        start_pt = getattr(self.active_tool, "start_point", None)
-        snap = compute_snap(
-            candidate_world=world_raw,
-            candidate_pixel=(px_x, px_y),
-            scene=self._snap_scene(px_x, px_y),
-            world_to_pixel=self._world_to_pixel,
-            threshold_px=self.snap_threshold_px,
-            project_onto_line=lambda s, d: self._project_to_lock_line(s, d, px_x, px_y),
-            chain_first_point=chain_first,
-            start_point=start_pt,
-            axis_lock=self.axis_lock,
-            shift_held=bool(modifiers & Qt.ShiftModifier),
-            reference_edge=self.reference_edge,
-            reference_mode=self.reference_mode,
-            inference_angle_deg=self.inference_angle_deg,
-            is_occluded=self._is_occluded,
-            face_under_cursor=self.pick_face_any(px_x, px_y)[0] is not None,
-            edge_threshold_px=self.edge_snap_threshold_px,
-            magnetic_axis_deg=getattr(self.active_tool, "magnetic_axis_deg", None),
-            screen_axis_px=getattr(self.active_tool, "screen_axis_px", None),
-            acquired_edge=self._acquired_edge,
-            acquired_point=self._acquired_point,
-            acquired_face_normal=self._acquired_face_normal,
-            acquired_points=self._encouraged,
-            shift_lock_dir=self._shift_lock[0] if self._shift_lock else None,
-            shift_lock_color=self._shift_lock[1] if self._shift_lock else None,
-            linear_mode=self.linear_inference_mode,
-            work_plane_normal=self._work_plane_normal(),
-            radial_arm=bool(getattr(self.active_tool, "radial_arm", False)),
-        )
-        snap = self._axis_source_cue(snap, px_x, px_y)
-        snap = self._extension_snap(snap, px_x, px_y)
+        p = self._last_mouse_pos.toPoint()
+        snap = self._snap_at(p.x(), p.y(), modifiers)
+        if snap is None:
+            return
         self.last_snap = snap
         ctx = ToolContext(
             viewport=self,
@@ -12857,89 +12845,27 @@ class Viewport(QOpenGLWidget):
         self.camera.toggle_two_point()
         self.update()
 
-    # ---- Extensions (views.extension_api) -----------------------------------
-    #: Built-in inferences an extension's may not override: a point with a
-    #: name is the user's target, and the snap engine already ranked it.
-    _NAMED_SNAPS = frozenset((
-        "endpoint", "midpoint", "arc_midpoint", "center", "origin",
-        "component_origin", "intersection", "close", "on_edge"))
-
-    def _extension_snap(self, snap, px_x: float, px_y: float):
-        """Offer the snap engine's answer to each extension's provider
-        (``ExtensionApp.add_snap_provider``); the first that returns a
-        :class:`SnapResult` wins. A named point is never overridden, and a
-        provider that raises is skipped — it cannot take the cursor away."""
-        providers = getattr(self, "_ext_snap_providers", None)
-        if not providers or snap is None or snap.kind in self._NAMED_SNAPS:
-            return snap
-        for fn in list(providers):
-            try:
-                got = fn(self, snap, px_x, px_y)
-            except Exception:  # noqa: BLE001 — a plugin never breaks input
-                import logging
-                logging.getLogger("ingetrazo.plugins").exception(
-                    "extension snap provider failed")
-                continue
-            if got is not None:
-                return got
-        return snap
-
     # ---- Helpers ------------------------------------------------------------
+    def _snap_at(
+        self, px_x: float, px_y: float, modifiers
+    ) -> Optional[SnapResult]:
+        """The snap engine's answer for the cursor at ``(px_x, px_y)``.
+
+        THE one code path: both ``_build_ctx`` (mouse motion and clicks) and
+        ``_refresh_snap`` (a modifier changing with the hand still) go through
+        here, so the :func:`compute_snap` argument list lives in exactly one
+        place. Returns ``None`` when the pixel casts no world point (the ray
+        misses the plane / the point is behind the camera). A tool that does
+        not snap (Select, Push/Pull) gets a ``"none"`` result instead - no
+        snap engine, no occlusion raycasts, no marker."""
+        return self.inference.snap(px_x, px_y, modifiers)
+
     def _build_ctx(self, ev) -> Optional[ToolContext]:
         self._sync_axes()
         p = ev.position().toPoint()
-        px_x, px_y = p.x(), p.y()
-        world_raw = self._world_from_pixel(px_x, px_y)
-        if world_raw is None:
+        snap = self._snap_at(p.x(), p.y(), ev.modifiers())
+        if snap is None:
             return None
-        # Tools that don't snap (Select, Push/Pull) skip the snap engine and its
-        # occlusion raycasts entirely, and show no snap marker.
-        if self.active_tool is not None and not self.active_tool.uses_snap:
-            snap = SnapResult(world_raw, "none")
-            return ToolContext(
-                viewport=self,
-                world=world_raw,
-                screen=ev.position(),
-                modifiers=ev.modifiers(),
-                snap=snap,
-            )
-        chain_first = None
-        start_pt = None
-        if self.active_tool is not None:
-            chain_first = getattr(self.active_tool, "chain_first_point", None)
-            start_pt = getattr(self.active_tool, "start_point", None)
-        shift_held = bool(ev.modifiers() & Qt.ShiftModifier)
-        snap = compute_snap(
-            candidate_world=world_raw,
-            candidate_pixel=(px_x, px_y),
-            scene=self._snap_scene(px_x, px_y),
-            world_to_pixel=self._world_to_pixel,
-            threshold_px=self.snap_threshold_px,
-            project_onto_line=lambda s, d: self._project_to_lock_line(s, d, px_x, px_y),
-            chain_first_point=chain_first,
-            start_point=start_pt,
-            axis_lock=self.axis_lock,
-            shift_held=shift_held,
-            reference_edge=self.reference_edge,
-            reference_mode=self.reference_mode,
-            inference_angle_deg=self.inference_angle_deg,
-            is_occluded=self._is_occluded,
-            face_under_cursor=self.pick_face_any(px_x, px_y)[0] is not None,
-            edge_threshold_px=self.edge_snap_threshold_px,
-            magnetic_axis_deg=getattr(self.active_tool, "magnetic_axis_deg", None),
-            screen_axis_px=getattr(self.active_tool, "screen_axis_px", None),
-            acquired_edge=self._acquired_edge,
-            acquired_point=self._acquired_point,
-            acquired_face_normal=self._acquired_face_normal,
-            acquired_points=self._encouraged,
-            shift_lock_dir=self._shift_lock[0] if self._shift_lock else None,
-            shift_lock_color=self._shift_lock[1] if self._shift_lock else None,
-            linear_mode=self.linear_inference_mode,
-            work_plane_normal=self._work_plane_normal(),
-            radial_arm=bool(getattr(self.active_tool, "radial_arm", False)),
-        )
-        snap = self._axis_source_cue(snap, px_x, px_y)
-        snap = self._extension_snap(snap, px_x, px_y)
         return ToolContext(
             viewport=self,
             world=snap.point,
